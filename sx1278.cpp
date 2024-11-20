@@ -13,7 +13,9 @@ Sx1278::Sx1278(config_t cfg) : Sx1278Spi(cfg.spi), _cfg(cfg)
   setupPins();
 
   // syncSettings();
-  // setDio0Mapping(dio0_t::CAD_DONE);
+  setDio0Mapping(dio0_t::RX_DONE);
+  gpio_install_isr_service(ESP_INTR_FLAG_LOWMED | ESP_INTR_FLAG_EDGE);
+  gpio_isr_handler_add(_cfg.dio0_pin, rx_callback, this);
 }
 
 Sx1278::~Sx1278()
@@ -241,10 +243,10 @@ void Sx1278::setupPins()
   gpio_config(&cfg_dio0);
 }
 
-void Sx1278::registerDio0Callback(void (*cb)(void *arg), void *arg)
+void Sx1278::registerDio0Callback(dio_cb_t cb, void *arg)
 {
-  gpio_install_isr_service(ESP_INTR_FLAG_LOWMED | ESP_INTR_FLAG_EDGE);
-  gpio_isr_handler_add(_cfg.dio0_pin, cb, arg);
+  _dio_cb = cb;
+  _dio_cb_arg = arg;
 }
 
 void Sx1278::resetRx()
@@ -257,4 +259,30 @@ void Sx1278::resetRx()
   writeIrqFlags(flags);
 
   writeSingle(sx_register_t::FIFO_RX_BASE_ADDR, RX_START);
+}
+
+void Sx1278::rx_callback(void *arg)
+{
+  Sx1278 *self = static_cast<Sx1278 *>(arg);
+  self->handleRx();
+}
+
+void Sx1278::handleRx()
+{
+  printf("[Sx1278] RX Detected\n");
+  reg_irq_flags_t flags = readIrqFlags();
+  if (flags.rx_done && flags.valid_header && !flags.payload_crc_error)
+  {
+    size_t size = rxSize();
+    printf("[Sx1278] RX size: %u bytes\n", size);
+    uint8_t buffer[size];
+    readRx(buffer);
+
+    if (_dio_cb != nullptr)
+    {
+      _dio_cb(_dio_cb_arg, buffer, size);
+    }
+  }
+
+  resetRx();
 }

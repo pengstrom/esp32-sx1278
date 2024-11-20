@@ -10,6 +10,8 @@
 class Sx1278 : public Sx1278Spi
 {
 public:
+  typedef void (*dio_cb_t)(void *arg, uint8_t *buffer, size_t size);
+
   static const uint8_t RX_START = 0;
   static const uint8_t TX_START = 0x80;
 
@@ -58,7 +60,7 @@ public:
   void setMode(mode_t mode);
   void setDio0Mapping(dio0_t mp);
 
-  void registerDio0Callback(void (*cb)(void *arg), void *arg);
+  void registerDio0Callback(dio_cb_t cb, void *arg);
 
   void resetRx();
 
@@ -74,6 +76,11 @@ private:
     uint32_t frf;
   };
   settings_t _reg_settings;
+  dio_cb_t _dio_cb = nullptr;
+  void *_dio_cb_arg = NULL;
+
+  static void rx_callback(void *arg);
+  void handleRx();
 
   void syncSettings();
 
