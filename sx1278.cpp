@@ -4,34 +4,40 @@
 #include <string>
 #include <strstream>
 #include <rom/ets_sys.h>
+#include <math.h>
 
 #define NS_PER_S (1000 * 1000 * 1000)
 
-Sx1278::Sx1278(config_t cfg) : _cfg(cfg)
+Sx1278::Sx1278(config_t cfg) : Sx1278Spi(cfg.spi), _cfg(cfg)
 {
-  if (cfg.clock_freq > CLOCK_MAX_FREQ)
-  {
-    std::ostrstream err;
-    err << "SX1278 maximum SPI clock frequency is " << CLOCK_MAX_FREQ << ", " << cfg.clock_freq << " given!";
-    throw std::runtime_error(err.str());
-  }
+  setupPins();
 
-  setupSpi();
+  // syncSettings();
+  // setDio0Mapping(dio0_t::CAD_DONE);
 }
 
 Sx1278::~Sx1278()
 {
-  esp_err_t err = spi_bus_remove_device(_device_handle);
-  if (err != ESP_OK)
-  {
-    return;
-  }
+}
 
-  err = spi_bus_free(_cfg.host);
-  if (err != ESP_OK)
-  {
-    return;
-  }
+void Sx1278::setDio0Mapping(dio0_t mp)
+{
+  writeSingle(sx_register_t::DIO_MAPPING_1, static_cast<uint8_t>(mp));
+}
+
+void Sx1278::syncSettings()
+{
+  uint8_t cfg1 = readSingle(sx_register_t::MODEM_CFG_1);
+  _reg_settings.modem_cfg_1.fromValue(cfg1);
+
+  uint8_t cfg2 = readSingle(sx_register_t::MODEM_CFG_2);
+  _reg_settings.modem_cfg_2.fromValue(cfg2);
+
+  uint8_t cfg3 = readSingle(sx_register_t::MODEM_CFG_3);
+  _reg_settings.modem_cfg_3.fromValue(cfg3);
+
+  reg_op_mode_t op_mode = readOpMode();
+  _reg_settings.op_mode = op_mode;
 }
 
 void Sx1278::reset()
@@ -42,110 +48,168 @@ void Sx1278::reset()
   vTaskDelay(pdMS_TO_TICKS(5));
 }
 
-void Sx1278::dumpRegisters(reg_data_t data[REG_COUNT], uint8_t max_addr, uint8_t min_addr)
+Sx1278::crc_status_t Sx1278::checkCrc()
 {
-  uint8_t start = min_addr;
-  size_t count = max_addr - min_addr;
-
-  spi_transaction_t cfg = {
-      .addr = start,
-      .length = count * 8,
-      .rx_buffer = data,
-  };
-  esp_err_t err = spi_device_transmit(_device_handle, &cfg);
-  if (err != ESP_OK)
+  // Check if crc in use
+  uint8_t hop_chan = readSingle(sx_register_t::HOP_CHANNEL);
+  reg_hop_channel_t hc = {};
+  hc.fromValue(hop_chan);
+  if (!hc.crc_on_payload)
   {
-    // handle3
-  }
-}
-
-Sx1278::reg_modem_cfg_t Sx1278::readModemCfg()
-{
-  uint8_t regs[3];
-
-  // cfg 1 and 2
-  spi_transaction_t cfg = {
-      .addr = regAddrRead(sx_register_t::MODEM_CFG_1),
-      .length = 2 * 8, // cfg 1 and 2 are adjecent
-      .rx_buffer = regs,
-  };
-  esp_err_t err = spi_device_transmit(_device_handle, &cfg);
-
-  // cfg 3
-  spi_transaction_t cfg = {
-      .addr = regAddrRead(sx_register_t::MODEM_CFG_3),
-      .length = 8,
-      .rx_buffer = regs + 2,
-  };
-  esp_err_t err = spi_device_transmit(_device_handle, &cfg);
-  if (err != ESP_OK)
-  {
-    // nhandle
+    return crc_status_t::CRC_NA;
   }
 
-  return reg_modem_cfg_t(regs[0], regs[1], regs[2]);
+  // Check for errors
+  reg_irq_flags_t reg = readIrqFlags();
+
+  // reset interrupt
+  reg_irq_flags_t reset = {};
+  reset.payload_crc_error = true;
+  writeIrqFlags(reset);
+
+  return reg.payload_crc_error ? crc_status_t::CRC_INVALID : crc_status_t::CRC_VALID;
 }
 
-void Sx1278::writeModemCfg(reg_modem_cfg_t modem_cfg)
+void Sx1278::correctFrequencyError()
 {
+  // read RF frequency
+  uint32_t frf = _reg_settings.frf;
+  float old_f = frf * F_STEP;
 
-  uint8_t regs[3];
-  modem_cfg.toValues(regs[0], regs[1], regs[3]);
+  // read frequency error
+  uint8_t fei[3];
+  readBurst(sx_register_t::FEI_MSB, fei, sizeof(fei));
+  int32_t freq_error = (fei[1] << 8) + fei[2];
+  freq_error += (fei[0] & 0b0111) << 16;
+  freq_error -= (fei[0] & 0b1000) << 16;
 
-  // cfg 1 and 2
-  spi_transaction_t cfg = {
-      .addr = regAddrWrite(sx_register_t::MODEM_CFG_1),
-      .length = 2 * 8, // cfg 1 and 2 are adjecent
-      .tx_buffer = regs,
-  };
-  esp_err_t err = spi_device_transmit(_device_handle, &cfg);
-  if (err != ESP_OK)
+  float bw_khz = bandwidthFrequencykHz(_reg_settings.modem_cfg_1.bw);
+
+  float f_err = ((freq_error * exp2f(24)) / XTAL_FREQ) * (bw_khz / 500.0);
+
+  // update frequency
+  float new_f = old_f - f_err;
+  uint32_t new_frf = std::round(new_f / F_STEP);
+  writeFrf(new_frf);
+
+  // update data rate
+  int16_t corr = std::round(0.95 * freq_error);
+  writeSingle(sx_register_t::PPM_CORRECTION, corr);
+
+  syncSettings();
+}
+
+uint8_t Sx1278::rxSize()
+{
+  return readSingle(sx_register_t::RX_NB_BYTES);
+}
+
+size_t Sx1278::readRx(uint8_t *data)
+{
+  uint8_t size = readSingle(sx_register_t::RX_NB_BYTES);
+  uint8_t last_packet = readSingle(sx_register_t::FIFO_RX_CURRENT);
+  writeSingle(sx_register_t::FIFO_ADDR_PTR, last_packet);
+  readFifo(data, size);
+  return size;
+}
+
+void Sx1278::writeTx(uint8_t *data, uint8_t len)
+{
+  writeSingle(sx_register_t::PAYLOAD_LENGTH, len);
+  writeSingle(sx_register_t::FIFO_ADDR_PTR, TX_START);
+  writeFifo(data, len);
+}
+
+void Sx1278::modeSleep()
+{
+  setMode(mode_t::SLEEP);
+}
+
+void Sx1278::modeStandby()
+{
+  setMode(mode_t::STDBY);
+}
+
+void Sx1278::modeTx()
+{
+  setMode(mode_t::TX);
+}
+
+void Sx1278::modeRxSingle()
+{
+  setMode(mode_t::RX_SINGLE);
+}
+
+void Sx1278::modeRxCont()
+{
+  setMode(mode_t::RX_CONT);
+}
+
+void Sx1278::modeCad()
+{
+  setMode(mode_t::CAD);
+}
+
+void Sx1278::setMode(mode_t mode)
+{
+  reg_op_mode_t op_mode = readOpMode();
+  op_mode.mode = mode;
+  writeOpMode(op_mode);
+
+  // Let the mode switch complete
+  int x = 0;
+  reg_op_mode_t old_op = op_mode;
+  do
   {
-    // nhandle
-  }
+    op_mode = old_op;
+    op_mode.mode = mode;
+    uint8_t old_value = writeSingle(sx_register_t::OP_MODE, op_mode.toValue());
+    old_op.fromValue(old_value);
+    vTaskDelay(1);
+    x++;
+  } while (old_op.mode != mode);
+  printf("Waited %d * 10 ms for mode\n", x);
+}
 
-  // cfg 3
-  spi_transaction_t cfg = {
-      .addr = regAddrWrite(sx_register_t::MODEM_CFG_3),
-      .length = 8,
-      .tx_buffer = regs + 2,
-  };
+void Sx1278::transmit()
+{
+  setMode(mode_t::TX);
 
-  esp_err_t err = spi_device_transmit(_device_handle, &cfg);
-  if (err != ESP_OK)
+  // Wait for completion
+  reg_irq_flags_t flags;
+  do
   {
-    // nhandle
+    flags = readIrqFlags();
+  } while (!flags.tx_done);
+
+  // clear tx_done flag
+  reg_irq_flags_t clear;
+  clear.tx_done = true;
+  writeIrqFlags(clear);
+
+  // we are now in mode STANDBY
+}
+
+void Sx1278::receive()
+{
+  reg_irq_flags_t flags;
+  do
+  {
+    flags = readIrqFlags();
+  } while (!flags.rx_done || flags.rx_timeout);
+
+  reg_irq_flags_t clear;
+  if (flags.rx_timeout)
+  {
+    // handle
+    clear.rx_timeout = true;
   }
-}
-
-void Sx1278::writeSingle(sx_register_t reg, uint8_t value, uint8_t *previous_value)
-{
-  sendReceive(reg, &value, previous_value, 1);
-}
-
-void Sx1278::writeBurst(sx_register_t reg, uint8_t *data, size_t data_bytes, uint8_t *previous_data)
-{
-  sendReceive(reg, data, previous_data, data_bytes);
-}
-
-void Sx1278::writeFifo(uint8_t *data, size_t data_bytes, uint8_t *previous_data)
-{
-  sendReceive(sx_register_t::FIFO, data, previous_data, data_bytes);
-}
-
-void Sx1278::readSingle(sx_register_t reg, uint8_t *value)
-{
-  sendReceive(reg, NULL, value, 1);
-}
-
-void Sx1278::readBurst(sx_register_t reg, uint8_t *data, size_t data_bytes)
-{
-  sendReceive(reg, NULL, data, data_bytes);
-}
-
-void Sx1278::readFifo(uint8_t *data, size_t data_bytes)
-{
-  sendReceive(sx_register_t::FIFO, NULL, data, data_bytes);
+  else
+  {
+    // ready to read RX data
+    clear.rx_done = true;
+  }
+  writeIrqFlags(clear);
 }
 
 void Sx1278::waitForReady()
@@ -157,58 +221,10 @@ void Sx1278::waitForReady()
   vTaskDelay(pdMS_TO_TICKS(10));
 }
 
-void Sx1278::setupSpi()
-{
-  _bus_cfg = {};
-  _bus_cfg.quadwp_io_num = -1;
-  _bus_cfg.quadhd_io_num = -1;
-  _bus_cfg.data4_io_num = -1;
-  _bus_cfg.data5_io_num = -1;
-  _bus_cfg.data6_io_num = -1;
-  _bus_cfg.data7_io_num = -1;
-  _bus_cfg.max_transfer_sz = FIFO_SIZE * 2; // 1 byte data + 1 byte addres for each FIFO entry at maximum
-  _bus_cfg.flags = SPICOMMON_BUSFLAG_MISO | SPICOMMON_BUSFLAG_MOSI | SPICOMMON_BUSFLAG_SCLK | SPICOMMON_BUSFLAG_MASTER;
-
-  if (_cfg.miso_pin != GPIO_NUM_NC && _cfg.mosi_pin != GPIO_NUM_NC && _cfg.sck_pin != GPIO_NUM_NC)
-  {
-    // use GPIO matrix pins
-    _bus_cfg.mosi_io_num = _cfg.mosi_pin;
-    _bus_cfg.miso_io_num = _cfg.miso_pin;
-    _bus_cfg.sclk_io_num = _cfg.sck_pin;
-  }
-  else
-  {
-    // use direct pin for bus
-    _bus_cfg.mosi_io_num = _cfg.mosi_pin,
-    _bus_cfg.miso_io_num = _cfg.miso_pin,
-    _bus_cfg.sclk_io_num = _cfg.sck_pin,
-    _bus_cfg.flags = _bus_cfg.flags | SPICOMMON_BUSFLAG_IOMUX_PINS;
-  }
-
-  uint16_t cycles_before_data = (_cfg.clock_freq * NSS_SETUP_TIME_NS) / NS_PER_S;
-  uint8_t cycles_after_data = (_cfg.clock_freq * NSS_HOLD_TIME_NS) / NS_PER_S;
-  _device_cfg = {
-      .command_bits = 8,
-      .address_bits = 8,
-      .mode = 0,
-      .cs_ena_pretrans = cycles_before_data,
-      .cs_ena_posttrans = cycles_after_data,
-      .clock_speed_hz = _cfg.clock_freq,
-      .input_delay_ns = DATA_SETUP_TIME_NS,
-      .spics_io_num = _cfg.nss_pin,
-      .flags = SPI_DEVICE_3WIRE,
-      .pre_cb = 0,
-      .post_cb = 0,
-  };
-
-  ESP_ERROR_CHECK(spi_bus_initialize(SPI_HOST, &_bus_cfg, SPI_DMA_CH_AUTO));
-  ESP_ERROR_CHECK(spi_bus_add_device(SPI_HOST, &_device_cfg, &_device_handle));
-}
-
 void Sx1278::setupPins()
 {
   gpio_config_t cfg_reset = {
-      .pin_bit_mask = 1 << _cfg.rst_pin,
+      .pin_bit_mask = (1U << _cfg.rst_pin),
       .mode = GPIO_MODE_INPUT_OUTPUT_OD,
       .pull_up_en = GPIO_PULLUP_ENABLE,
       .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -216,99 +232,29 @@ void Sx1278::setupPins()
   gpio_config(&cfg_reset);
   gpio_set_level(_cfg.rst_pin, 1);
 
-  // gpio_config_t cfg_dio0 = {
-  //     .pin_bit_mask = 1 << _cfg.dio0_pin,
-  //     .mode = GPIO_MODE_INPUT,
-  //     .pull_up_en = GPIO_PULLUP_ENABLE,
-  //     .pull_down_en = GPIO_PULLDOWN_DISABLE,
-  // };
-  // gpio_config(&cfg_dio0);
+  gpio_config_t cfg_dio0 = {
+      .pin_bit_mask = (1U << _cfg.dio0_pin),
+      .mode = GPIO_MODE_INPUT,
+      .pull_up_en = GPIO_PULLUP_ENABLE,
+      .pull_down_en = GPIO_PULLDOWN_DISABLE,
+  };
+  gpio_config(&cfg_dio0);
 }
 
-uint8_t Sx1278::regAddrRead(sx_register_t reg)
+void Sx1278::registerDio0Callback(void (*cb)(void *arg), void *arg)
 {
-  return regAddrWrite(reg) | READ_FLAG;
+  gpio_install_isr_service(ESP_INTR_FLAG_LOWMED | ESP_INTR_FLAG_EDGE);
+  gpio_isr_handler_add(_cfg.dio0_pin, cb, arg);
 }
 
-uint8_t Sx1278::regAddrWrite(sx_register_t reg)
+void Sx1278::resetRx()
 {
-  return static_cast<uint8_t>(reg);
+  // clear rx flags
+  reg_irq_flags_t flags;
+  flags.valid_header = true;
+  flags.rx_done = true;
+  flags.payload_crc_error = true;
+  writeIrqFlags(flags);
+
+  writeSingle(sx_register_t::FIFO_RX_BASE_ADDR, RX_START);
 }
-
-void Sx1278::sendReceive(sx_register_t reg, uint8_t *send, uint8_t *receive, size_t data_bytes)
-{
-  if (!send && !receive)
-  {
-    return;
-  }
-
-  uint8_t addr;
-  if (!send)
-  {
-    addr = regAddrRead(reg);
-  }
-  else
-  {
-    addr = regAddrWrite(reg);
-  }
-  spi_transaction_t cfg =
-      {
-          .addr = regAddrWrite(reg),
-          .length = 8 * data_bytes,
-          .tx_buffer = send,
-          .rx_buffer = receive,
-      };
-
-  esp_err_t err = spi_device_transmit(_device_handle, &cfg);
-  if (err != ESP_OK)
-  {
-    // handle
-  }
-}
-
-// const Sx1278::register_t registers[] =
-// {
-
-// {0x00, "RegFifo 0x00 FIFO read/write access
-// 0x01 RegOpMode 0x01 Operating mode & LoRaTM / FSK selection
-// 0x02 RegBitrateMsb
-// Unused
-// 0x1A Bit Rate setting, Most Significant Bits
-// 0x03 RegBitrateLsb 0x0B Bit Rate setting, Least Significant Bits
-// 0x04 RegFdevMsb 0x00 Frequency Deviation setting, Most Significant Bits
-// 0x05 RegFdevLsb 0x52 Frequency Deviation setting, Least Significant Bits
-// 0x06 RegFrfMsb 0x6C RF Carrier Frequency, Most Significant Bits
-// 0x07 RegFrfMid 0x80 RF Carrier Frequency, Intermediate Bits
-// 0x08 RegFrfLsb 0x00 RF Carrier Frequency, Least Significant Bits
-// 0x09 RegPaConfig 0x4F PA selection and Output Power control
-// 0x0A RegPaRamp 0x09 Control of PA ramp time, low phase noise PLL
-// 0x0B RegOcp 0x2B Over Current Protection control
-// 0x0C RegLna 0x20 LNA settings
-// 0x0D RegRxConfig RegFifoAddrPtr 0x08 0x0E AFC, AGC, ctrl FIFO SPI pointer
-// 0x0E RegRssiConfig RegFifoTxBa-
-// seAddr 0x02 RSSI Start Tx data
-// 0x0F RegRssiCollision RegFifoRxBa-
-// seAddr 0x0A RSSI Collision detector Start Rx data
-// 0x10 RegRssiThresh FifoRxCurren-
-// tAddr 0xFF RSSI Threshold control Start address of last
-// packet received
-// 0x11 RegRssiValue RegIrqFlagsMask n/a n/a RSSI value in dBm Optional IRQ flag mask
-// 0x12 RegRxBw RegIrqFlags 0x15 Channel Filter BW Control IRQ flags
-// 0x13 RegAfcBw RegRxNbBytes 0x0B AFC Channel Filter BW Number of received bytes
-// 0x14 RegOokPeak RegRxHeaderCnt
-// ValueMsb 0x28 OOK demodulator Number of valid headers
-// received
-// 0x15 RegOokFix RegRxHeaderCnt
-// ValueLsb 0x0C Threshold of the OOK demod
-// 0x16 RegOokAvg RegRxPacketCnt
-// ValueMsb 0x12 Average of the OOK demod Number of valid packets
-// received
-// 0x17 Reserved17 RegRxPacketCnt
-// ValueLsb 0x47 -
-// 0x18 Reserved18 RegModemStat 0x32 - Live LoRaTM modem
-// status
-// 0x19 Reserved19 RegPktSnrValue 0x3E - Espimation of last packet
-// SNR
-// 0x1A RegAfcFei RegPktRssiValue 0x00 AFC and FEI control RSSI of last packet
-
-// };
